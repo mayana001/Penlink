@@ -1,0 +1,27 @@
+name: PenLink
+options:
+  bundleIdPrefix: com.penlink.personal
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  PenLink:
+    type: application
+    platform: iOS
+    sources: [ios]
+    info:
+      path: ios-Info.plist
+      properties:
+        CFBundleDisplayName: PenLink
+        NSLocalNetworkUsageDescription: "Подключение к компьютеру по локальной сети"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.penlink.personal.app
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "2"
+        CODE_SIGNING_ALLOWED: "NO"
