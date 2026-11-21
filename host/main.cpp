@@ -7,6 +7,8 @@
 //          penlink-host.exe --ip 192.168.0.5 (Wi-Fi: IP iPad)   доп.: --fps 60 --kbps 40000
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <d3d11_4.h>
+#include <timeapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
