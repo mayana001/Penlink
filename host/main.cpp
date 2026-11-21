@@ -1,5 +1,5 @@
 // PenLink host (Windows 10 1809+/11)
-// DXGI Desktop Duplication -> H.264 (NVENC or libx264) -> TCP (USB via usbmuxd or Wi-Fi)
+// DXGI Desktop Duplication or Windows Graphics Capture -> H.264 (NVENC or libx264) -> TCP (USB via usbmuxd or Wi-Fi)
 // iPad -> Apple Pencil события -> Windows Pointer Injection (PT_PEN: нажим, наклон); хоткеи -> SendInput
 // Сообщения: [u32 длина LE][тип + данные]. Очередей кадров нет: кодирование синхронно в потоке захвата.
 //
@@ -14,6 +14,7 @@
 #include <timeapi.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include "wgc_capture.hpp"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -315,6 +316,7 @@ struct Streamer {
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<IDXGIOutput1> output;
     ComPtr<IDXGIOutputDuplication> dupl;
+    WgcCapture graphicsCapture;
     ComPtr<ID3D11Texture2D> staging;
     RECT mon{};
     int W = 0, H = 0;
@@ -324,8 +326,11 @@ struct Streamer {
     std::atomic<bool> running{false}, idrReq{true}, linkOk{true};
     std::thread th;
 
+    bool captureReady() const { return dupl || graphicsCapture.ready(); }
+
     bool initCapture() {
         dupl.Reset();
+        graphicsCapture.reset();
         ComPtr<IDXGIFactory1> factory;
         HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
         if (FAILED(hr)) {
@@ -380,29 +385,45 @@ struct Streamer {
             ComPtr<ID3D11Device> device;
             ComPtr<ID3D11DeviceContext> context;
             ComPtr<IDXGIOutput1> selected;
+            const std::string displayName = utf8(display.desc.DeviceName);
+            const RECT bounds = display.desc.DesktopCoordinates;
+            const int width = bounds.right - bounds.left;
+            const int height = bounds.bottom - bounds.top;
             hr = createDevice(display.adapter.Get(), &device, &context);
-            if (SUCCEEDED(hr)) hr = display.output.As(&selected);
+            if (FAILED(hr)) {
+                fprintf(stderr, "Capture output %s: ", displayName.c_str());
+                dxError("D3D11CreateDevice", hr);
+                continue;
+            }
+
+            hr = display.output.As(&selected);
             if (SUCCEEDED(hr)) hr = selected->DuplicateOutput(device.Get(), &dupl);
             if (FAILED(hr)) {
-                fprintf(stderr, "Capture output %s: ", utf8(display.desc.DeviceName).c_str());
-                dxError("D3D11/DXGI Desktop Duplication initialization", hr);
-                continue;
+                fprintf(stderr, "Capture output %s: ", displayName.c_str());
+                dxError("DXGI Desktop Duplication", hr);
+                fprintf(stderr, "Trying Windows Graphics Capture for %s.\n", displayName.c_str());
+                hr = graphicsCapture.init(display.desc.Monitor, device.Get(), width, height);
+                if (FAILED(hr)) {
+                    dxError("Windows Graphics Capture initialization (requires Windows 10 1903+)", hr);
+                    continue;
+                }
             }
             dev = device;
             ctx = context;
             adapter = display.adapter;
             output = selected;
             staging.Reset();
-            mon = display.desc.DesktopCoordinates;
-            W = mon.right - mon.left;
-            H = mon.bottom - mon.top;
+            mon = bounds;
+            W = width;
+            H = height;
             DXGI_ADAPTER_DESC1 ad{};
             adapter->GetDesc1(&ad);
-            fprintf(stderr, "Capture: %s on %s, %dx%d at (%ld,%ld)\n",
-                    utf8(display.desc.DeviceName).c_str(), utf8(ad.Description).c_str(), W, H, mon.left, mon.top);
+            fprintf(stderr, "Capture: %s on %s, %dx%d at (%ld,%ld) via %s\n",
+                    displayName.c_str(), utf8(ad.Description).c_str(), W, H, mon.left, mon.top,
+                    dupl ? "DXGI Desktop Duplication" : "Windows Graphics Capture");
             return true;
         }
-        fprintf(stderr, "No DXGI desktop output could be captured. Check that a display is active and the host runs in the interactive Windows session.\n");
+        fprintf(stderr, "No desktop output could be captured. Check that a display is active and the host runs in the interactive Windows session.\n");
         return false;
     }
 
@@ -514,7 +535,69 @@ struct Streamer {
         return sendAll(sock, tx.data(), (int)tx.size());
     }
 
+    HRESULT copyCapturedFrame(Encoder& encoder, int& err, uint32_t& tCap) {
+        ComPtr<ID3D11Texture2D> texture;
+        if (graphicsCapture.ready()) {
+            HRESULT hr = graphicsCapture.acquire(texture);
+            if (hr != S_OK) return hr;
+            tCap = nowUs();
+            err = copyFrame(encoder, texture.Get());
+            graphicsCapture.releaseFrame();
+            return S_OK;
+        }
+
+        ComPtr<IDXGIResource> resource;
+        DXGI_OUTDUPL_FRAME_INFO info{};
+        HRESULT hr = dupl->AcquireNextFrame(50, &info, &resource);
+        if (FAILED(hr)) return hr;
+        if (info.LastPresentTime.QuadPart == 0 && !idrReq) {
+            dupl->ReleaseFrame();
+            return S_FALSE;
+        }
+        hr = resource.As(&texture);
+        if (SUCCEEDED(hr)) {
+            tCap = nowUs();
+            err = copyFrame(encoder, texture.Get());
+        }
+        dupl->ReleaseFrame();
+        return hr;
+    }
+
+    bool restoreDuplication() {
+        dupl.Reset();
+        staging.Reset();
+        // Lock/unlock and desktop switches can temporarily invalidate duplication.
+        HRESULT hr = DXGI_ERROR_ACCESS_LOST;
+        for (int attempt = 0; attempt < 10 && running; ++attempt) {
+            Sleep(100);
+            DXGI_OUTPUT_DESC current{};
+            hr = output->GetDesc(&current);
+            if (FAILED(hr)) break;
+            if (!current.AttachedToDesktop || !EqualRect(&current.DesktopCoordinates, &mon)) {
+                hr = DXGI_ERROR_ACCESS_LOST;
+                break;
+            }
+            hr = output->DuplicateOutput(dev.Get(), &dupl);
+            if (SUCCEEDED(hr)) return true;
+        }
+        dxError("Could not restore DXGI capture; reconnecting to select the display again", hr);
+        return false;
+    }
+
     void loop(Encoder& encoder, int fps, int kbps) {
+        WgcApartment apartment;
+        const bool useGraphicsCapture = graphicsCapture.ready();
+        if (useGraphicsCapture) {
+            HRESULT hr = apartment.result();
+            if (SUCCEEDED(hr)) hr = graphicsCapture.start();
+            if (FAILED(hr)) {
+                dxError("Windows Graphics Capture start", hr);
+                graphicsCapture.reset();
+                shutdown(sock, SD_BOTH);
+                return;
+            }
+        }
+
         int64_t pts = 0;
         uint32_t fid = 0;
         int nf = 0;
@@ -524,45 +607,20 @@ struct Streamer {
                 encoder.codec->codec->name, encoder.codec->width, encoder.codec->height, fps, kbps);
 
         while (running && linkOk) {
-            ComPtr<IDXGIResource> res;
-            DXGI_OUTDUPL_FRAME_INFO fi{};
-            HRESULT hr = dupl->AcquireNextFrame(50, &fi, &res);
-            if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+            uint32_t tCap = 0;
+            int err = 0;
+            HRESULT hr = copyCapturedFrame(encoder, err, tCap);
+            if (hr == S_FALSE) continue;
+            if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                if (useGraphicsCapture) Sleep(2);
+                continue;
+            }
             if (FAILED(hr)) {
-                dxError("AcquireNextFrame", hr);
-                dupl.Reset();
-                staging.Reset();
-                // Lock/unlock and desktop switches can temporarily invalidate duplication.
-                DXGI_OUTPUT_DESC current{};
-                for (int attempt = 0; attempt < 10 && running; ++attempt) {
-                    Sleep(100);
-                    hr = output->GetDesc(&current);
-                    if (FAILED(hr)) break;
-                    if (!current.AttachedToDesktop || !EqualRect(&current.DesktopCoordinates, &mon)) {
-                        hr = DXGI_ERROR_ACCESS_LOST;
-                        break;
-                    }
-                    hr = output->DuplicateOutput(dev.Get(), &dupl);
-                    if (SUCCEEDED(hr)) break;
-                }
-                if (!dupl) {
-                    dxError("Could not restore capture; reconnecting to select the display again", hr);
-                    break;
-                }
+                dxError(useGraphicsCapture ? "Windows Graphics Capture frame" : "DXGI capture frame", hr);
+                if (useGraphicsCapture || !restoreDuplication()) break;
                 idrReq = true;
                 continue;
             }
-
-            if (fi.LastPresentTime.QuadPart == 0 && !idrReq) {
-                dupl->ReleaseFrame();
-                continue;
-            }
-            uint32_t tCap = nowUs();
-            ComPtr<ID3D11Texture2D> tex;
-            hr = res.As(&tex);
-            if (FAILED(hr)) dxError("Desktop frame texture", hr);
-            int err = SUCCEEDED(hr) ? copyFrame(encoder, tex.Get()) : AVERROR(EIO);
-            dupl->ReleaseFrame();
 
             if (err >= 0) {
                 encoder.frame->pts = pts++;
@@ -598,6 +656,7 @@ struct Streamer {
                 nf = 0; sumCap = 0; t0 = tEnd;
             }
         }
+        if (useGraphicsCapture) graphicsCapture.reset();
         if (running) shutdown(sock, SD_BOTH);
     }
 
@@ -627,6 +686,7 @@ int main(int argc, char** argv) {
     }
     fps = std::clamp(fps, 30, 240); kbps = std::clamp(kbps, 2000, 200000);
 
+    WgcApartment apartment;
     Streamer S;
     if (!S.initCapture()) { fprintf(stderr, "Не удалось начать захват экрана\n"); return 1; }
     Injector inj;
@@ -635,7 +695,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> buf(1 << 16);
     for (;;) {
-        if (!S.dupl) {
+        if (!S.captureReady()) {
             if (!S.initCapture()) { Sleep(1000); continue; }
             inj.mon = S.mon;
         }
