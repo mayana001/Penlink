@@ -154,8 +154,23 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         switch g.state {
         case .began, .changed:
             var alt = Float.pi / 2
-            if #available(iOS 16.1, *) { alt = Float(g.altitudeAngle) }
-            link?.sendPen(phase: 3, x: x, y: y, pressure: 0, altitude: alt, azimuth: Float(g.azimuthAngle(in: self)))
+               
+var azimuth: Float = 0
+
+if #available(iOS 16.4, *) {
+    alt = Float(g.altitudeAngle)
+    azimuth = Float(g.azimuthAngle(in: self))
+}
+
+link?.sendPen(
+    phase: 3,
+    x: x,
+    y: y,
+    pressure: 0,
+    altitude: alt,
+    azimuth: azimuth
+)
+
         default: link?.sendPen(phase: 4, x: x, y: y, pressure: 0, altitude: Float.pi / 2, azimuth: 0)
         }
     }
