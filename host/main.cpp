@@ -1,5 +1,5 @@
-// PenLink host (Windows 10 1809+/11, NVIDIA GPU)
-// DXGI Desktop Duplication -> GPU copy -> h264_nvenc (FFmpeg, D3D11 hw frames) -> TCP (по USB через usbmuxd или по Wi-Fi)
+// PenLink host (Windows 10 1809+/11)
+// DXGI Desktop Duplication -> H.264 (NVENC or libx264) -> TCP (USB via usbmuxd or Wi-Fi)
 // iPad -> Apple Pencil события -> Windows Pointer Injection (PT_PEN: нажим, наклон); хоткеи -> SendInput
 // Сообщения: [u32 длина LE][тип + данные]. Очередей кадров нет: кодирование синхронно в потоке захвата.
 //
@@ -7,12 +7,11 @@
 //          penlink-host.exe --ip 192.168.0.5 (Wi-Fi: IP iPad)   доп.: --fps 60 --kbps 40000
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <d3d11_4.h>
-#include <timeapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
+#include <timeapi.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <atomic>
@@ -24,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cerrno>
 #include <climits>
 #include <algorithm>
 extern "C" {
@@ -31,6 +31,7 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 }
 using Microsoft::WRL::ComPtr;
 
@@ -169,38 +170,333 @@ struct Injector {
 };
 
 // ---------------- Захват + кодирование ----------------
+static void dxError(const char* step, HRESULT hr) {
+    fprintf(stderr, "%s: HRESULT 0x%08lX\n", step, static_cast<unsigned long>(hr));
+}
+
+static void avError(const char* step, int err) {
+    char message[AV_ERROR_MAX_STRING_SIZE]{};
+    av_strerror(err, message, sizeof message);
+    fprintf(stderr, "%s: %s (%d)\n", step, message, err);
+}
+
+static std::string utf8(const wchar_t* value) {
+    char buffer[512]{};
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, buffer, sizeof buffer, nullptr, nullptr);
+    return buffer;
+}
+
+static HRESULT createDevice(IDXGIAdapter1* adapter, ID3D11Device** dev, ID3D11DeviceContext** ctx) {
+    return D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                             nullptr, 0, D3D11_SDK_VERSION, dev, nullptr, ctx);
+}
+
+struct Encoder {
+    AVCodecContext* codec = nullptr;
+    AVFrame* frame = nullptr;
+    AVPacket* packet = nullptr;
+    SwsContext* scale = nullptr;
+    ComPtr<ID3D11DeviceContext> upload;
+    bool nvenc = false;
+
+    ~Encoder() { reset(); }
+    void reset() {
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+        avcodec_free_context(&codec);
+        sws_freeContext(scale);
+        scale = nullptr;
+        upload.Reset();
+        nvenc = false;
+    }
+
+    bool init(const char* name, int w, int h, int fps, int kbps,
+              ID3D11Device* dev = nullptr, ID3D11DeviceContext* ctx = nullptr) {
+        reset();
+        const AVCodec* encoder = avcodec_find_encoder_by_name(name);
+        if (!encoder) {
+            fprintf(stderr, "FFmpeg encoder %s not found. Use a build with NVENC and libx264 (e.g. BtbN win64-gpl-shared).\n", name);
+            return false;
+        }
+        codec = avcodec_alloc_context3(encoder);
+        frame = av_frame_alloc();
+        packet = av_packet_alloc();
+        if (!codec || !frame || !packet) {
+            fprintf(stderr, "%s: could not allocate FFmpeg buffers.\n", name);
+            return false;
+        }
+        nvenc = dev != nullptr;
+        codec->width = nvenc ? w : ((w + 1) & ~1);
+        codec->height = nvenc ? h : ((h + 1) & ~1);
+        codec->time_base = {1, fps};
+        codec->framerate = {fps, 1};
+        codec->pix_fmt = nvenc ? AV_PIX_FMT_D3D11 : AV_PIX_FMT_YUV420P;
+        codec->bit_rate = (int64_t)kbps * 1000;
+        codec->rc_max_rate = codec->bit_rate;
+        codec->rc_buffer_size = (int)(codec->bit_rate / fps * 2);
+        codec->gop_size = INT_MAX;
+        codec->max_b_frames = 0;
+        codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+        if (nvenc) {
+            ComPtr<ID3D11Multithread> mt;
+            if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&mt)))) mt->SetMultithreadProtected(TRUE);
+            AVBufferRef* hw = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+            if (!hw) {
+                avError("av_hwdevice_ctx_alloc (NVENC)", AVERROR(ENOMEM));
+                return false;
+            }
+            auto* dc = reinterpret_cast<AVD3D11VADeviceContext*>(
+                reinterpret_cast<AVHWDeviceContext*>(hw->data)->hwctx);
+            dc->device = dev;
+            dev->AddRef();
+            int err = av_hwdevice_ctx_init(hw);
+            if (err >= 0) codec->hw_frames_ctx = av_hwframe_ctx_alloc(hw);
+            av_buffer_unref(&hw);
+            if (err < 0 || !codec->hw_frames_ctx) {
+                avError("D3D11 device/frames allocation (NVENC)", err < 0 ? err : AVERROR(ENOMEM));
+                return false;
+            }
+            auto* fc = reinterpret_cast<AVHWFramesContext*>(codec->hw_frames_ctx->data);
+            fc->format = AV_PIX_FMT_D3D11;
+            fc->sw_format = AV_PIX_FMT_BGRA;
+            fc->width = w;
+            fc->height = h;
+            err = av_hwframe_ctx_init(codec->hw_frames_ctx);
+            if (err < 0) {
+                avError("av_hwframe_ctx_init (NVENC)", err);
+                return false;
+            }
+            upload = ctx;
+        } else {
+            scale = sws_getContext(w, h, AV_PIX_FMT_BGRA, codec->width, codec->height,
+                                   codec->pix_fmt, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!scale) {
+                fprintf(stderr, "libx264: could not initialize BGRA to YUV420P conversion.\n");
+                return false;
+            }
+            frame->format = codec->pix_fmt;
+            frame->width = codec->width;
+            frame->height = codec->height;
+            int err = av_frame_get_buffer(frame, 0);
+            if (err < 0) {
+                avError("av_frame_get_buffer (libx264)", err);
+                return false;
+            }
+        }
+
+        AVDictionary* options = nullptr;
+        av_dict_set(&options, "forced-idr", "1", 0);
+        if (nvenc) {
+            av_dict_set(&options, "preset", "p1", 0);
+            av_dict_set(&options, "tune", "ull", 0);
+            av_dict_set(&options, "rc", "cbr", 0);
+            av_dict_set(&options, "zerolatency", "1", 0);
+            av_dict_set(&options, "delay", "0", 0);
+            av_dict_set(&options, "profile", "high", 0);
+        } else {
+            av_dict_set(&options, "preset", "ultrafast", 0);
+            av_dict_set(&options, "tune", "zerolatency", 0);
+            av_dict_set(&options, "x264-params", "annexb=1:repeat-headers=1", 0);
+        }
+        int err = avcodec_open2(codec, encoder, &options);
+        av_dict_free(&options);
+        if (err < 0) {
+            avError(name, err);
+            return false;
+        }
+        return true;
+    }
+};
+
 struct Streamer {
-    ComPtr<ID3D11Device> dev; ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<IDXGIAdapter1> adapter; ComPtr<IDXGIOutputDuplication> dupl;
-    RECT mon{}; int W = 0, H = 0; bool nvidia = false;
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<IDXGIOutput1> output;
+    ComPtr<IDXGIOutputDuplication> dupl;
+    ComPtr<ID3D11Texture2D> staging;
+    RECT mon{};
+    int W = 0, H = 0;
     SOCKET sock = INVALID_SOCKET;
-    std::mutex sm; std::vector<uint8_t> tx;
+    std::mutex sm;
+    std::vector<uint8_t> tx;
     std::atomic<bool> running{false}, idrReq{true}, linkOk{true};
     std::thread th;
 
     bool initCapture() {
         dupl.Reset();
-        if (!dev) {
-            ComPtr<IDXGIFactory1> f; CreateDXGIFactory1(IID_PPV_ARGS(&f));
-            for (UINT i = 0;; i++) {
-                ComPtr<IDXGIAdapter1> a;
-                if (f->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
-                ComPtr<IDXGIOutput> o;
-                if (FAILED(a->EnumOutputs(0, &o))) continue;  // берём адаптер, к которому подключён монитор
-                if (SUCCEEDED(D3D11CreateDevice(a.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                                nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx))) { adapter = a; break; }
-            }
-            if (!dev) return false;
-            DXGI_ADAPTER_DESC1 ad{}; adapter->GetDesc1(&ad);
-            nvidia = (ad.VendorId == 0x10DE);
-            wprintf(L"GPU, к которому подключён экран: %ls\n", ad.Description);
-            ComPtr<ID3D11Multithread> mt; if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
+        ComPtr<IDXGIFactory1> factory;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) {
+            dxError("CreateDXGIFactory1 (capture)", hr);
+            return false;
         }
-        ComPtr<IDXGIOutput> o; adapter->EnumOutputs(0, &o);
-        DXGI_OUTPUT_DESC d; o->GetDesc(&d);
-        mon = d.DesktopCoordinates; W = mon.right - mon.left; H = mon.bottom - mon.top;
-        ComPtr<IDXGIOutput1> o1; o.As(&o1);
-        return SUCCEEDED(o1->DuplicateOutput(dev.Get(), &dupl));
+
+        struct Display {
+            ComPtr<IDXGIAdapter1> adapter;
+            ComPtr<IDXGIOutput> output;
+            DXGI_OUTPUT_DESC desc;
+        };
+        std::vector<Display> displays;
+        HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        for (UINT i = 0;; ++i) {
+            ComPtr<IDXGIAdapter1> a;
+            hr = factory->EnumAdapters1(i, &a);
+            if (hr == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(hr)) {
+                dxError("EnumAdapters1 (capture)", hr);
+                break;
+            }
+            DXGI_ADAPTER_DESC1 ad{};
+            if (FAILED(a->GetDesc1(&ad))) continue;
+            fprintf(stderr, "DXGI adapter %u: %s (vendor 0x%04X, device 0x%04X)%s\n",
+                    i, utf8(ad.Description).c_str(), ad.VendorId, ad.DeviceId,
+                    ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE ? " [software]" : "");
+            if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            for (UINT j = 0;; ++j) {
+                ComPtr<IDXGIOutput> o;
+                hr = a->EnumOutputs(j, &o);
+                if (hr == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(hr)) {
+                    dxError("EnumOutputs", hr);
+                    break;
+                }
+                DXGI_OUTPUT_DESC d{};
+                hr = o->GetDesc(&d);
+                if (FAILED(hr)) {
+                    dxError("IDXGIOutput::GetDesc", hr);
+                    continue;
+                }
+                fprintf(stderr, "  Output %s: %s%s\n", utf8(d.DeviceName).c_str(),
+                        d.AttachedToDesktop ? "attached" : "detached",
+                        d.Monitor == primary ? " (primary)" : "");
+                if (d.AttachedToDesktop) displays.push_back({a, o, d});
+            }
+        }
+        std::stable_partition(displays.begin(), displays.end(),
+                              [primary](const Display& d) { return d.desc.Monitor == primary; });
+        for (const auto& display : displays) {
+            ComPtr<ID3D11Device> device;
+            ComPtr<ID3D11DeviceContext> context;
+            ComPtr<IDXGIOutput1> selected;
+            hr = createDevice(display.adapter.Get(), &device, &context);
+            if (SUCCEEDED(hr)) hr = display.output.As(&selected);
+            if (SUCCEEDED(hr)) hr = selected->DuplicateOutput(device.Get(), &dupl);
+            if (FAILED(hr)) {
+                fprintf(stderr, "Capture output %s: ", utf8(display.desc.DeviceName).c_str());
+                dxError("D3D11/DXGI Desktop Duplication initialization", hr);
+                continue;
+            }
+            dev = device;
+            ctx = context;
+            adapter = display.adapter;
+            output = selected;
+            staging.Reset();
+            mon = display.desc.DesktopCoordinates;
+            W = mon.right - mon.left;
+            H = mon.bottom - mon.top;
+            DXGI_ADAPTER_DESC1 ad{};
+            adapter->GetDesc1(&ad);
+            fprintf(stderr, "Capture: %s on %s, %dx%d at (%ld,%ld)\n",
+                    utf8(display.desc.DeviceName).c_str(), utf8(ad.Description).c_str(), W, H, mon.left, mon.top);
+            return true;
+        }
+        fprintf(stderr, "No DXGI desktop output could be captured. Check that a display is active and the host runs in the interactive Windows session.\n");
+        return false;
+    }
+
+    bool initEncoder(Encoder& encoder, int fps, int kbps) {
+        DXGI_ADAPTER_DESC1 capture{};
+        adapter->GetDesc1(&capture);
+        ComPtr<IDXGIFactory1> factory;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) dxError("CreateDXGIFactory1 (NVENC)", hr);
+        if (factory) {
+            for (UINT i = 0;; ++i) {
+                ComPtr<IDXGIAdapter1> a;
+                hr = factory->EnumAdapters1(i, &a);
+                if (hr == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(hr)) {
+                    dxError("EnumAdapters1 (NVENC)", hr);
+                    break;
+                }
+                DXGI_ADAPTER_DESC1 ad{};
+                if (FAILED(a->GetDesc1(&ad)) || ad.VendorId != 0x10DE) continue;
+                const bool same = ad.AdapterLuid.HighPart == capture.AdapterLuid.HighPart &&
+                                  ad.AdapterLuid.LowPart == capture.AdapterLuid.LowPart;
+                ComPtr<ID3D11Device> device = dev;
+                ComPtr<ID3D11DeviceContext> context = ctx;
+                fprintf(stderr, "Trying NVENC on %s (DXGI adapter %u)\n", utf8(ad.Description).c_str(), i);
+                if (!same) {
+                    hr = createDevice(a.Get(), device.ReleaseAndGetAddressOf(), context.ReleaseAndGetAddressOf());
+                    if (FAILED(hr)) {
+                        dxError("D3D11CreateDevice (NVENC)", hr);
+                        continue;
+                    }
+                }
+                if (encoder.init("h264_nvenc", W, H, fps, kbps, device.Get(), context.Get())) {
+                    fprintf(stderr, "Encoder: NVENC on %s (%s)\n", utf8(ad.Description).c_str(),
+                            same ? "GPU copy" : "capture GPU -> system memory -> NVIDIA GPU");
+                    return true;
+                }
+            }
+        }
+        fprintf(stderr, "NVENC unavailable. Falling back to FFmpeg libx264.\n");
+        return encoder.init("libx264", W, H, fps, kbps);
+    }
+
+    int copyFrame(Encoder& encoder, ID3D11Texture2D* texture) {
+        if (encoder.nvenc) {
+            av_frame_unref(encoder.frame);
+            int err = av_hwframe_get_buffer(encoder.codec->hw_frames_ctx, encoder.frame, 0);
+            if (err < 0) return err;
+        }
+
+        auto* target = reinterpret_cast<ID3D11Texture2D*>(encoder.frame->data[0]);
+        UINT subresource = static_cast<UINT>(reinterpret_cast<intptr_t>(encoder.frame->data[1]));
+        if (encoder.nvenc && encoder.upload.Get() == ctx.Get()) {
+            ctx->CopySubresourceRegion(target, subresource, 0, 0, 0, texture, 0, nullptr);
+            ctx->Flush();
+            return 0;
+        }
+
+        if (!staging) {
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            desc.MiscFlags = 0;
+            HRESULT hr = dev->CreateTexture2D(&desc, nullptr, &staging);
+            if (FAILED(hr)) {
+                dxError("CreateTexture2D (capture staging)", hr);
+                return AVERROR(EIO);
+            }
+        }
+
+        ctx->CopyResource(staging.Get(), texture);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        HRESULT hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            dxError("Map (capture readback)", hr);
+            return AVERROR(EIO);
+        }
+        int err = 0;
+        if (encoder.nvenc) {
+            encoder.upload->UpdateSubresource(target, subresource, nullptr, mapped.pData, mapped.RowPitch, 0);
+            encoder.upload->Flush();
+        } else {
+            err = av_frame_make_writable(encoder.frame);
+            if (err >= 0) {
+                const uint8_t* source[] = {static_cast<const uint8_t*>(mapped.pData)};
+                int stride[] = {static_cast<int>(mapped.RowPitch)};
+                err = sws_scale(encoder.scale, source, stride, 0, H, encoder.frame->data, encoder.frame->linesize);
+                if (err != encoder.codec->height) err = err < 0 ? err : AVERROR(EIO);
+            }
+        }
+        ctx->Unmap(staging.Get(), 0);
+        return err < 0 ? err : 0;
     }
 
     // одно сообщение = [u32 длина][данные]; всё одним send, чтобы не плодить пакеты
@@ -218,82 +514,105 @@ struct Streamer {
         return sendAll(sock, tx.data(), (int)tx.size());
     }
 
-    void loop(int fps, int kbps) {
-        if (!nvidia) {
-            fprintf(stderr, "Экран выводится не через NVIDIA (гибридная графика). NVENC здесь недоступен.\n"
-                            "Переключите ноутбук в режим дискретной графики (MUX / Ultimate / GPU-only) и перезагрузитесь.\n");
-            return;
-        }
-        AVBufferRef* hw = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-        auto* dc = (AVD3D11VADeviceContext*)((AVHWDeviceContext*)hw->data)->hwctx;
-        dc->device = dev.Get(); dev->AddRef();
-        if (av_hwdevice_ctx_init(hw) < 0) { fprintf(stderr, "hwdevice init failed\n"); return; }
-        AVBufferRef* fr = av_hwframe_ctx_alloc(hw);
-        auto* fc = (AVHWFramesContext*)fr->data;
-        fc->format = AV_PIX_FMT_D3D11; fc->sw_format = AV_PIX_FMT_BGRA; fc->width = W; fc->height = H; fc->initial_pool_size = 3;
-        if (av_hwframe_ctx_init(fr) < 0) { fprintf(stderr, "hwframes init failed\n"); return; }
-
-        const AVCodec* codec = avcodec_find_encoder_by_name("h264_nvenc");
-        if (!codec) { fprintf(stderr, "h264_nvenc not found (нужна сборка FFmpeg с NVENC)\n"); return; }
-        AVCodecContext* cc = avcodec_alloc_context3(codec);
-        cc->width = W; cc->height = H; cc->time_base = { 1, fps }; cc->framerate = { fps, 1 };
-        cc->pix_fmt = AV_PIX_FMT_D3D11; cc->hw_frames_ctx = av_buffer_ref(fr);
-        cc->bit_rate = (int64_t)kbps * 1000; cc->rc_max_rate = cc->bit_rate;
-        cc->rc_buffer_size = (int)(cc->bit_rate / fps * 2);
-        cc->gop_size = INT_MAX; cc->max_b_frames = 0; cc->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        av_opt_set(cc->priv_data, "preset", "p1", 0);
-        av_opt_set(cc->priv_data, "tune", "ull", 0);
-        av_opt_set(cc->priv_data, "rc", "cbr", 0);
-        av_opt_set(cc->priv_data, "zerolatency", "1", 0);
-        av_opt_set(cc->priv_data, "delay", "0", 0);
-        av_opt_set(cc->priv_data, "forced-idr", "1", 0);
-        av_opt_set(cc->priv_data, "profile", "high", 0);
-        if (avcodec_open2(cc, codec, nullptr) < 0) { fprintf(stderr, "avcodec_open2 failed\n"); return; }
-
-        AVFrame* frame = av_frame_alloc(); AVPacket* pkt = av_packet_alloc();
-        int64_t pts = 0; uint32_t fid = 0;
-        int nf = 0; double sumCap = 0; uint32_t t0 = nowUs();
-        fprintf(stderr, "Стрим %dx%d @%d fps, %d kbps\n", W, H, fps, kbps);
+    void loop(Encoder& encoder, int fps, int kbps) {
+        int64_t pts = 0;
+        uint32_t fid = 0;
+        int nf = 0;
+        double sumCap = 0;
+        uint32_t t0 = nowUs();
+        fprintf(stderr, "Stream: %s, %dx%d @%d fps, %d kbps\n",
+                encoder.codec->codec->name, encoder.codec->width, encoder.codec->height, fps, kbps);
 
         while (running && linkOk) {
-            ComPtr<IDXGIResource> res; DXGI_OUTDUPL_FRAME_INFO fi;
-            HRESULT hr = dupl ? dupl->AcquireNextFrame(50, &fi, &res) : DXGI_ERROR_ACCESS_LOST;
+            ComPtr<IDXGIResource> res;
+            DXGI_OUTDUPL_FRAME_INFO fi{};
+            HRESULT hr = dupl->AcquireNextFrame(50, &fi, &res);
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-            if (FAILED(hr)) { Sleep(100); initCapture(); continue; }
-            if (fi.LastPresentTime.QuadPart == 0 && !idrReq) { dupl->ReleaseFrame(); continue; }  // обновился только курсор
-            uint32_t tCap = nowUs();
-            ComPtr<ID3D11Texture2D> tex; res.As(&tex);
-            av_hwframe_get_buffer(fr, frame, 0);
-            ctx->CopySubresourceRegion((ID3D11Texture2D*)frame->data[0], (UINT)(intptr_t)frame->data[1], 0, 0, 0, tex.Get(), 0, nullptr);
-            ctx->Flush();
-            dupl->ReleaseFrame();
-            frame->pts = pts++;
-            frame->pict_type = idrReq.exchange(false) ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
-            if (avcodec_send_frame(cc, frame) >= 0) {
-                while (avcodec_receive_packet(cc, pkt) == 0) {
-                    if (!sendFrame(pkt->data, pkt->size, pkt->flags & AV_PKT_FLAG_KEY, fid++, tCap)) linkOk = false;
-                    av_packet_unref(pkt);
+            if (FAILED(hr)) {
+                dxError("AcquireNextFrame", hr);
+                dupl.Reset();
+                staging.Reset();
+                // Lock/unlock and desktop switches can temporarily invalidate duplication.
+                DXGI_OUTPUT_DESC current{};
+                for (int attempt = 0; attempt < 10 && running; ++attempt) {
+                    Sleep(100);
+                    hr = output->GetDesc(&current);
+                    if (FAILED(hr)) break;
+                    if (!current.AttachedToDesktop || !EqualRect(&current.DesktopCoordinates, &mon)) {
+                        hr = DXGI_ERROR_ACCESS_LOST;
+                        break;
+                    }
+                    hr = output->DuplicateOutput(dev.Get(), &dupl);
+                    if (SUCCEEDED(hr)) break;
                 }
+                if (!dupl) {
+                    dxError("Could not restore capture; reconnecting to select the display again", hr);
+                    break;
+                }
+                idrReq = true;
+                continue;
             }
-            av_frame_unref(frame);
-            uint32_t tEnd = nowUs(); sumCap += (tEnd - tCap) / 1000.0; nf++;
+
+            if (fi.LastPresentTime.QuadPart == 0 && !idrReq) {
+                dupl->ReleaseFrame();
+                continue;
+            }
+            uint32_t tCap = nowUs();
+            ComPtr<ID3D11Texture2D> tex;
+            hr = res.As(&tex);
+            if (FAILED(hr)) dxError("Desktop frame texture", hr);
+            int err = SUCCEEDED(hr) ? copyFrame(encoder, tex.Get()) : AVERROR(EIO);
+            dupl->ReleaseFrame();
+
+            if (err >= 0) {
+                encoder.frame->pts = pts++;
+                encoder.frame->pict_type = idrReq.exchange(false) ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+                err = avcodec_send_frame(encoder.codec, encoder.frame);
+            }
+            if (err >= 0) {
+                while ((err = avcodec_receive_packet(encoder.codec, encoder.packet)) == 0) {
+                    AVPacket* pkt = encoder.packet;
+                    bool sent = sendFrame(pkt->data, pkt->size, pkt->flags & AV_PKT_FLAG_KEY, fid++, tCap);
+                    av_packet_unref(pkt);
+                    if (!sent) {
+                        linkOk = false;
+                        break;
+                    }
+                }
+                if (err == AVERROR(EAGAIN)) err = 0;
+            }
+            if (err < 0) {
+                avError(encoder.codec->codec->name, err);
+                if (!encoder.nvenc || !running) break;
+                fprintf(stderr, "NVENC frame failed. Switching to libx264.\n");
+                if (!encoder.init("libx264", W, H, fps, kbps)) break;
+                idrReq = true;
+                continue;
+            }
+
+            uint32_t tEnd = nowUs();
+            sumCap += (tEnd - tCap) / 1000.0;
+            ++nf;
             if (tEnd - t0 > 1000000) {
                 fprintf(stderr, "fps=%d  захват→отправка=%.2f мс\n", nf, sumCap / nf);
                 nf = 0; sumCap = 0; t0 = tEnd;
             }
         }
-        avcodec_free_context(&cc); av_frame_free(&frame); av_packet_free(&pkt);
-        av_buffer_unref(&fr); av_buffer_unref(&hw);
+        if (running) shutdown(sock, SD_BOTH);
     }
 
-    void start(int fps, int kbps) {
+    void start(Encoder& encoder, int fps, int kbps) {
         stop(); running = true; idrReq = true; linkOk = true;
-        th = std::thread([=] { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); loop(fps, kbps); });
+        th = std::thread([this, &encoder, fps, kbps] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            loop(encoder, fps, kbps);
+        });
     }
     void stop() { running = false; if (th.joinable()) th.join(); }
 };
 
 int main(int argc, char** argv) {
+    SetConsoleOutputCP(CP_UTF8);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
@@ -316,12 +635,24 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> buf(1 << 16);
     for (;;) {
-        SOCKET s = ip.empty() ? usbConnect(IPAD_PORT) : tcpConnect(ip.c_str(), IPAD_PORT);
-        if (s == INVALID_SOCKET) { Sleep(1000); continue; }       // ждём iPad / приложение
+        if (!S.dupl) {
+            if (!S.initCapture()) { Sleep(1000); continue; }
+            inj.mon = S.mon;
+        }
+        Encoder encoder;
+        if (!S.initEncoder(encoder, fps, kbps)) {
+            fprintf(stderr, "No usable H.264 encoder. Check the FFmpeg DLLs and the NVIDIA driver.\n");
+            return 1;
+        }
+        SOCKET s;
+        do {
+            s = ip.empty() ? usbConnect(IPAD_PORT) : tcpConnect(ip.c_str(), IPAD_PORT);
+            if (s == INVALID_SOCKET) Sleep(1000);
+        } while (s == INVALID_SOCKET);
         int one = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&one, sizeof one);
         S.sock = s;
         printf("iPad подключён.\n");
-        S.start(fps, kbps);
+        S.start(encoder, fps, kbps);
         for (;;) {
             uint32_t n;
             if (!recvAll(s, &n, 4) || n == 0 || n > buf.size() || !recvAll(s, buf.data(), (int)n)) break;
