@@ -3,6 +3,10 @@ name: Build Windows host
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'host/**'
+      - '.github/workflows/build-host.yml'
 
 jobs:
   build:
