@@ -119,25 +119,83 @@ struct Injector {
     HSYNTHETICPOINTERDEVICE dev = nullptr;
     RECT mon{};
     bool inRange = false;
+    bool inContact = false;
+    ULONGLONG nextPenError = 0;
+
+    ~Injector() { reset(); }
+
+    void reset() {
+        if (dev) DestroySyntheticPointerDevice(dev);
+        dev = nullptr;
+        inRange = false;
+        inContact = false;
+        nextPenError = 0;
+    }
 
     bool init(RECT r) {
         mon = r;
-        if (!dev) dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
+        if (!dev) {
+            dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
+            if (!dev) fprintf(stderr, "CreateSyntheticPointerDevice (pen): Win32 error %lu\n", GetLastError());
+        }
         return dev != nullptr;
     }
+
+    bool inject(POINTER_TYPE_INFO& info, POINTER_FLAGS flags, uint8_t phase) {
+        info.penInfo.pointerInfo.pointerFlags = flags;
+        if (InjectSyntheticPointerInput(dev, &info, 1)) {
+            inRange = (flags & POINTER_FLAG_INRANGE) != 0;
+            inContact = (flags & POINTER_FLAG_INCONTACT) != 0;
+            return true;
+        }
+        DWORD error = GetLastError();
+        ULONGLONG now = GetTickCount64();
+        if (now >= nextPenError) {
+            fprintf(stderr, "InjectSyntheticPointerInput (pen phase %u, flags 0x%08lX): Win32 error %lu\n",
+                    static_cast<unsigned>(phase), static_cast<unsigned long>(flags), error);
+            nextPenError = now + 1000;
+        }
+        return false;
+    }
+
     void pen(const PenPkt& p) {
-        if (!dev) return;
+        POINTER_FLAGS flags;
+        switch (p.phase) {
+        case 0: // touch down
+            if (inContact) return;
+            flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN;
+            break;
+        case 1: // touch move
+            if (!inContact) return;
+            flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE;
+            break;
+        case 2: // touch up or cancellation
+            if (!inContact) return;
+            flags = POINTER_FLAG_INRANGE | POINTER_FLAG_UP;
+            break;
+        case 3: // hover
+            if (inContact) return;
+            flags = POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE;
+            break;
+        case 4: // hover ended
+            if (inContact || !inRange) return;
+            flags = POINTER_FLAG_UPDATE;
+            break;
+        default:
+            return;
+        }
+        if (!dev && !init(mon)) return;
         POINTER_TYPE_INFO info{};
         info.type = PT_PEN;
         POINTER_PEN_INFO& pi = info.penInfo;
         POINTER_INFO& pp = pi.pointerInfo;
         pp.pointerType = PT_PEN;
-        pp.pointerId = 0;
+        pp.pointerId = 1;
         float x = std::clamp(p.x, 0.f, 1.f), y = std::clamp(p.y, 0.f, 1.f);
         pp.ptPixelLocation.x = mon.left + (LONG)lroundf(x * (mon.right - mon.left - 1));
         pp.ptPixelLocation.y = mon.top + (LONG)lroundf(y * (mon.bottom - mon.top - 1));
         pi.penMask = PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
-        bool contact = (p.phase == 0 || p.phase == 1);
+        bool contact = (flags & POINTER_FLAG_INCONTACT) != 0;
         pi.pressure = contact ? (UINT32)std::clamp(p.pressure * 1024.f, 1.f, 1024.f) : 0;
         // Apple: altitude 0 = плашмя, pi/2 = перпендикулярно; azimuth — направление в плоскости экрана.
         float ca = cosf(p.altitude), sa = std::max(sinf(p.altitude), 0.01f);
@@ -145,20 +203,20 @@ struct Injector {
         pi.tiltX = (INT32)std::clamp(atan2f(tx, sa) * 57.29578f, -90.f, 90.f);
         pi.tiltY = (INT32)std::clamp(atan2f(ty, sa) * 57.29578f, -90.f, 90.f);
         if (p.buttons & 1) pi.penFlags |= PEN_FLAG_BARREL;
-        if (p.buttons & 2) pi.penFlags |= PEN_FLAG_ERASER;
-
-        POINTER_FLAGS fl = POINTER_FLAG_NONE;
-        switch (p.phase) {
-        case 0: fl = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON | POINTER_FLAG_DOWN; break;
-        case 1: fl = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON | POINTER_FLAG_UPDATE; break;
-        case 2: fl = POINTER_FLAG_INRANGE | POINTER_FLAG_UP; break;
-        case 3: fl = POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE; break;
-        case 4: fl = POINTER_FLAG_UPDATE; break;
+        if (p.buttons & 2) {
+            pi.penFlags |= PEN_FLAG_INVERTED;
+            if (contact) pi.penFlags |= PEN_FLAG_ERASER;
         }
-        if (!inRange && (fl & POINTER_FLAG_INRANGE)) fl |= POINTER_FLAG_NEW;
-        inRange = (fl & POINTER_FLAG_INRANGE) != 0;
-        pp.pointerFlags = fl;
-        InjectSyntheticPointerInput(dev, &info, 1);
+
+        // Establish proximity before the first contact, even if the iPad sent no hover packet.
+        if (p.phase == 0 && !inRange) {
+            POINTER_TYPE_INFO hover = info;
+            hover.penInfo.pressure = 0;
+            hover.penInfo.penFlags &= ~PEN_FLAG_ERASER;
+            if (!inject(hover, POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE, 3)) return;
+        }
+
+        if (!inject(info, flags, p.phase) && p.phase == 2) reset();
     }
     static void key(uint8_t action, uint8_t mods, uint16_t vk) {  // action: 0 tap, 1 down, 2 up
         std::vector<INPUT> v;
@@ -709,6 +767,10 @@ int main(int argc, char** argv) {
             s = ip.empty() ? usbConnect(IPAD_PORT) : tcpConnect(ip.c_str(), IPAD_PORT);
             if (s == INVALID_SOCKET) Sleep(1000);
         } while (s == INVALID_SOCKET);
+        if (!inj.init(S.mon)) {
+            closesocket(s);
+            return 1;
+        }
         int one = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&one, sizeof one);
         S.sock = s;
         printf("iPad подключён.\n");
@@ -725,6 +787,7 @@ int main(int argc, char** argv) {
         }
         shutdown(s, SD_BOTH);          // будим поток кодирования, если он завис в send()
         S.stop(); closesocket(s); S.sock = INVALID_SOCKET;
+        inj.reset();
         printf("Соединение потеряно, жду iPad...\n");
     }
 }
